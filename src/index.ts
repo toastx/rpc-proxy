@@ -1,6 +1,8 @@
 interface Env {
 	HELIUS_API_KEY: string;
 	CORS_ALLOW_ORIGIN?: string;
+	BACKEND_WEBHOOK_URL: string; // Add your Railway/Vercel URL here
+	WEBHOOK_SECRET?: string;      // Optional: Shared secret to verify Helius calls
 }
 
 // Configuration - adjust as needed
@@ -15,49 +17,68 @@ const KEEPALIVE_MESSAGE = JSON.stringify({
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		// Validate required environment
+		const url = new URL(request.url);
+
+		// 1. ROUTE: Helius Webhook Listener
+		// Point Helius to: https://your-worker.workers.dev/helius-webhook
+		if (url.pathname === '/helius-webhook') {
+			return handleWebhookForwarding(request, env);
+		}
+
+		// 2. SECURITY: Validate Environment
 		if (!env.HELIUS_API_KEY) {
 			return new Response('Missing HELIUS_API_KEY', { status: 500 });
 		}
 
-		// CORS setup
-		// If the request is an OPTIONS request, return a 200 response with permissive CORS headers
-		// This is required for the Helius RPC Proxy to work from the browser and arbitrary origins
-		// If you wish to restrict the origins that can access your Helius RPC Proxy, you can do so by
-		// changing the `*` in the `Access-Control-Allow-Origin` header to a specific origin.
-		// For example, if you wanted to allow requests from `https://example.com`, you would change the
-		// header to `https://example.com`. Multiple domains are supported by verifying that the request
-		// originated from one of the domains in the `CORS_ALLOW_ORIGIN` environment variable.
-		const supportedDomains = env.CORS_ALLOW_ORIGIN?.split(',').map(d => d.trim());
-		const corsHeaders: Record<string, string> = {
-			'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, OPTIONS',
-			'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-		};
-
-		if (supportedDomains) {
-			const origin = request.headers.get('Origin');
-			if (origin && supportedDomains.includes(origin)) {
-				corsHeaders['Access-Control-Allow-Origin'] = origin;
-			}
-		} else {
-			corsHeaders['Access-Control-Allow-Origin'] = '*';
-		}
-
-		// Handle preflight
+		// 3. CORS & PREFLIGHT (Keep existing logic)
+		const corsHeaders = getCorsHeaders(request, env);
 		if (request.method === 'OPTIONS') {
 			return new Response(null, { status: 200, headers: corsHeaders });
 		}
 
-		// WebSocket handling
+		// 4. ROUTE: WebSocket Handling
 		const upgrade = request.headers.get('Upgrade')?.toLowerCase();
 		if (upgrade === 'websocket') {
 			return handleWebSocket(request, env, corsHeaders);
 		}
 
-		// HTTP RPC proxy
+		// 5. ROUTE: Standard RPC Proxy (with IP Anonymization)
 		return handleRPC(request, env, corsHeaders);
 	},
 };
+
+/**
+ * Forwards Helius Webhooks to your real backend server.
+ * This acts as a shield so Helius never talks directly to your origin.
+ */
+async function handleWebhookForwarding(request: Request, env: Env): Promise<Response> {
+	if (request.method !== 'POST') {
+		return new Response('Method Not Allowed', { status: 405 });
+	}
+
+	// Optional: Check a custom auth header you set in the Helius Dashboard
+	if (env.WEBHOOK_SECRET) {
+		const authHeader = request.headers.get('Authorization');
+		if (authHeader !== env.WEBHOOK_SECRET) {
+			return new Response('Unauthorized', { status: 401 });
+		}
+	}
+
+	const payload = await request.text();
+
+	// Forward the webhook to your Railway/Vercel backend
+	const backendResponse = await fetch(env.BACKEND_WEBHOOK_URL, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json',
+			'X-Forwarded-From': 'Cloudflare-Worker-Shield'
+		},
+		body: payload
+	});
+
+	return new Response(backendResponse.body, { status: backendResponse.status });
+}
+
 
 async function handleWebSocket(request: Request, env: Env, corsHeaders: Record<string, string>): Promise<Response> {
 	const { search } = new URL(request.url);
@@ -230,30 +251,43 @@ async function handleRPC(request: Request, env: Env, corsHeaders: Record<string,
 		const { pathname, search } = new URL(request.url);
 		const payload = await request.text();
 
-		// Determine target endpoint
 		const targetHost = pathname === '/' ? 'mainnet.helius-rpc.com' : 'api.helius.xyz';
 		const targetUrl = `https://${targetHost}${pathname}?api-key=${env.HELIUS_API_KEY}${search ? `&${search.slice(1)}` : ''}`;
+
+		// ANONYMIZATION: Create new headers and strip the user's real IP
+		const anonymizedHeaders = new Headers(request.headers);
+		anonymizedHeaders.delete("cf-connecting-ip");
+		anonymizedHeaders.delete("x-forwarded-for");
+		anonymizedHeaders.delete("true-client-ip");
+		
+		// Set standard content type
+		anonymizedHeaders.set('Content-Type', 'application/json');
 
 		const proxyRequest = new Request(targetUrl, {
 			method: request.method,
 			body: payload || null,
-			headers: {
-				'Content-Type': 'application/json',
-				'X-Helius-Cloudflare-Proxy': 'true',
-			}
+			headers: anonymizedHeaders
 		});
 
 		const response = await fetch(proxyRequest);
-
-		return new Response(response.body, {
-			status: response.status,
-			headers: corsHeaders
-		});
-
+		return new Response(response.body, { status: response.status, headers: corsHeaders });
 	} catch {
-		return new Response('Proxy Error', {
-			status: 502,
-			headers: corsHeaders
-		});
+		return new Response('Proxy Error', { status: 502, headers: corsHeaders });
 	}
+}
+
+// Helper for CORS logic
+function getCorsHeaders(request: Request, env: Env): Record<string, string> {
+	const supportedDomains = env.CORS_ALLOW_ORIGIN?.split(',').map(d => d.trim());
+	const headers: Record<string, string> = {
+		'Access-Control-Allow-Methods': 'GET, HEAD, POST, PUT, OPTIONS',
+		'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+	};
+	const origin = request.headers.get('Origin');
+	if (supportedDomains && origin && supportedDomains.includes(origin)) {
+		headers['Access-Control-Allow-Origin'] = origin;
+	} else {
+		headers['Access-Control-Allow-Origin'] = '*';
+	}
+	return headers;
 }
